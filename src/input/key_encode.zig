@@ -469,12 +469,13 @@ fn legacy(
     // If we have no UTF8 text then the only possibility is the
     // alt-prefix handling of unshifted codepoints... so we process that.
     if (utf8.len == 0) {
-        if (try legacyAltPrefix(
+        _ = try legacyAltPrefix(
+            writer,
             event,
             binding_mods,
             all_mods,
             opts,
-        )) |byte| try writer.print("\x1B{c}", .{byte});
+        );
         return;
     }
 
@@ -527,13 +528,12 @@ fn legacy(
     // If we have alt-pressed and alt-esc-prefix is enabled, then
     // we need to prefix the utf8 sequence with an esc.
     if (try legacyAltPrefix(
+        writer,
         event,
         binding_mods,
         all_mods,
         opts,
-    )) |byte| {
-        return try writer.print("\x1B{c}", .{byte});
-    }
+    )) return;
 
     // If we are on macOS, command+keys do not encode text. It isn't
     // typical for command+keys on macOS to ever encode text. They
@@ -552,47 +552,71 @@ fn legacy(
 }
 
 fn legacyAltPrefix(
+    writer: *std.Io.Writer,
     event: key.KeyEvent,
     binding_mods: key.Mods,
     mods: key.Mods,
     opts: Options,
-) !?u8 {
+) std.Io.Writer.Error!bool {
     // This only takes effect with alt pressed
-    if (!binding_mods.alt or !opts.alt_esc_prefix) return null;
+    if (!binding_mods.alt or !opts.alt_esc_prefix) return false;
 
     // On macOS, we only handle option like alt in certain
     // circumstances. Otherwise, macOS does a unicode translation
     // and we allow that to happen.
     if (comptime builtin.os.tag == .macos) {
         switch (opts.macos_option_as_alt) {
-            .false => return null,
-            .left => if (mods.sides.alt == .right) return null,
-            .right => if (mods.sides.alt == .left) return null,
+            .false => return false,
+            .left => if (mods.sides.alt == .right) return false,
+            .right => if (mods.sides.alt == .left) return false,
             .true => {},
         }
     }
 
-    // Otherwise, we require utf8 to already have the byte represented.
+    // A single byte is already the exact text we want to prefix. In
+    // particular, this preserves shifted ASCII punctuation.
     const utf8 = event.utf8;
     if (utf8.len == 1) {
-        if (std.math.cast(u8, utf8[0])) |byte| {
-            return byte;
-        }
+        try writer.writeByte(0x1B);
+        try writer.writeAll(utf8);
+        return true;
     }
 
-    // If UTF8 isn't set, we will allow unshifted codepoints through.
-    if (event.unshifted_codepoint > 0) {
-        if (std.math.cast(
-            u8,
-            event.unshifted_codepoint,
-        )) |byte| {
-            return byte;
+    var unshifted_buf: [4]u8 = undefined;
+    const value: []const u8 = value: {
+        // On macOS, Option may translate the text into a different Unicode
+        // value. When Option is configured as Alt, use the physical key's
+        // unshifted codepoint just as the single-byte implementation did.
+        if (comptime builtin.os.tag == .macos) {
+            if (event.unshifted_codepoint > 0) {
+                const len = std.unicode.utf8Encode(
+                    event.unshifted_codepoint,
+                    &unshifted_buf,
+                ) catch return false;
+                break :value unshifted_buf[0..len];
+            }
         }
-    }
 
-    // Else, we can't figure out the byte to alt-prefix so we
-    // exit this handling.
-    return null;
+        // Outside of the macOS translation case, prefix the complete UTF-8
+        // text rather than truncating it to a single byte.
+        if (utf8.len > 0) break :value utf8;
+
+        // Frontends may omit UTF-8 while still supplying the physical key's
+        // unshifted codepoint. Encode the complete scalar in that case.
+        if (event.unshifted_codepoint > 0) {
+            const len = std.unicode.utf8Encode(
+                event.unshifted_codepoint,
+                &unshifted_buf,
+            ) catch return false;
+            break :value unshifted_buf[0..len];
+        }
+
+        return false;
+    };
+
+    try writer.writeByte(0x1B);
+    try writer.writeAll(value);
+    return true;
 }
 
 /// A helper to memcpy a src value to a buffer and return the result.
@@ -2128,6 +2152,63 @@ test "legacy: alt+e only unshifted" {
     try testing.expectEqualStrings("\x1Be", writer.buffered());
 }
 
+test "legacy: alt+unicode" {
+    const Case = struct {
+        text: []const u8,
+        codepoint: u21,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .text = "é", .codepoint = 'é', .expected = "\x1B" ++ "é" },
+        .{ .text = "ő", .codepoint = 'ő', .expected = "\x1B" ++ "ő" },
+        .{ .text = "界", .codepoint = '界', .expected = "\x1B" ++ "界" },
+        .{ .text = "😀", .codepoint = '😀', .expected = "\x1B" ++ "😀" },
+    };
+
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try legacy(&writer, .{
+            .key = .unidentified,
+            .utf8 = case.text,
+            .unshifted_codepoint = case.codepoint,
+            .mods = .{ .alt = true },
+        }, .{
+            .alt_esc_prefix = true,
+            .macos_option_as_alt = .true,
+        });
+        try testing.expectEqualStrings(case.expected, writer.buffered());
+    }
+}
+
+test "legacy: alt+unicode only unshifted" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .unidentified,
+        .unshifted_codepoint = '界',
+        .mods = .{ .alt = true },
+    }, .{
+        .alt_esc_prefix = true,
+        .macos_option_as_alt = .true,
+    });
+    try testing.expectEqualStrings("\x1B" ++ "界", writer.buffered());
+}
+
+test "legacy: alt+unicode without unshifted" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, .{
+        .key = .unidentified,
+        .utf8 = "😀",
+        .mods = .{ .alt = true },
+    }, .{
+        .alt_esc_prefix = true,
+        .macos_option_as_alt = .true,
+    });
+    try testing.expectEqualStrings("\x1B" ++ "😀", writer.buffered());
+}
+
 test "legacy: alt+x macos" {
     if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
 
@@ -2171,8 +2252,9 @@ test "legacy: alt+ф" {
         .mods = .{ .alt = true },
     }, .{
         .alt_esc_prefix = true,
+        .macos_option_as_alt = .true,
     });
-    try testing.expectEqualStrings("ф", writer.buffered());
+    try testing.expectEqualStrings("\x1B" ++ "ф", writer.buffered());
 }
 
 test "legacy: ctrl+c" {
