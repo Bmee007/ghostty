@@ -2056,6 +2056,28 @@ test "legacy: esc with utf8 (dead key state)" {
     try testing.expectEqualStrings("A", writer.buffered());
 }
 
+test "legacy: alt+escape with modify other state 2" {
+    var buf: [128]u8 = undefined;
+
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try legacy(&writer, .{
+            .key = .escape,
+            .mods = .{ .alt = true },
+        }, .{});
+        try testing.expectEqualStrings("\x1b\x1b", writer.buffered());
+    }
+
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try legacy(&writer, .{
+            .key = .escape,
+            .mods = .{ .alt = true },
+        }, .{ .modify_other_keys_state_2 = true });
+        try testing.expectEqualStrings("\x1b[27;3;27~", writer.buffered());
+    }
+}
+
 test "legacy: ctrl+shift+minus (underscore on US)" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);

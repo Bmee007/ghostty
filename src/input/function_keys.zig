@@ -224,7 +224,8 @@ pub const keys = keys: {
 
     result.set(.escape, &.{
         .{ .mods = .{ .shift = true }, .sequence = "\x1b[27;2;27~" },
-        .{ .mods = .{ .alt = true }, .sequence = "\x1b\x1b" },
+        .{ .mods = .{ .alt = true }, .modify_other_keys = .set, .sequence = "\x1b\x1b" },
+        .{ .mods = .{ .alt = true }, .modify_other_keys = .set_other, .sequence = "\x1b[27;3;27~" },
         .{ .mods = .{ .alt = true, .shift = true }, .sequence = "\x1b[27;4;27~" },
         .{ .mods = .{ .ctrl = true }, .sequence = "\x1b[27;5;27~" },
         .{ .mods = .{ .ctrl = true, .shift = true }, .sequence = "\x1b[27;6;27~" },
