@@ -88,6 +88,8 @@ pub const keys = keys: {
     result.set(.delete, pcStyle("\x1b[3;{}~") ++ .{Entry{ .sequence = "\x1B[3~" }});
     result.set(.page_up, pcStyle("\x1b[5;{}~") ++ .{Entry{ .sequence = "\x1B[5~" }});
     result.set(.page_down, pcStyle("\x1b[6;{}~") ++ .{Entry{ .sequence = "\x1B[6~" }});
+    result.set(.help, pcStyle("\x1b[28;{}~") ++ .{Entry{ .sequence = "\x1B[28~" }});
+    result.set(.context_menu, pcStyle("\x1b[29;{}~") ++ .{Entry{ .sequence = "\x1B[29~" }});
 
     // Function Keys. todo: f26-f35 but we need to add to input.Key
     result.set(.f1, pcStyle("\x1b[1;{}P") ++ .{Entry{ .sequence = "\x1BOP" }});

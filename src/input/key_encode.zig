@@ -2685,6 +2685,43 @@ test "legacy: f13 through f25" {
     }
 }
 
+test "legacy: help and context menu" {
+    const Case = struct { key: key.Key, code: u8 };
+    const cases = [_]Case{
+        .{ .key = .help, .code = 28 },
+        .{ .key = .context_menu, .code = 29 },
+    };
+
+    var buf: [128]u8 = undefined;
+    var expected_buf: [32]u8 = undefined;
+    for (cases) |case| {
+        {
+            var writer: std.Io.Writer = .fixed(&buf);
+            try legacy(&writer, .{ .key = case.key }, .{});
+            const expected = try std.fmt.bufPrint(
+                &expected_buf,
+                "\x1b[{}~",
+                .{case.code},
+            );
+            try testing.expectEqualStrings(expected, writer.buffered());
+        }
+
+        {
+            var writer: std.Io.Writer = .fixed(&buf);
+            try legacy(&writer, .{
+                .key = case.key,
+                .mods = .{ .ctrl = true },
+            }, .{ .modify_other_keys_state_2 = true });
+            const expected = try std.fmt.bufPrint(
+                &expected_buf,
+                "\x1b[{};5~",
+                .{case.code},
+            );
+            try testing.expectEqualStrings(expected, writer.buffered());
+        }
+    }
+}
+
 test "legacy: left_shift+tab" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
