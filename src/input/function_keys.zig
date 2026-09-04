@@ -104,22 +104,22 @@ pub const keys = keys: {
     result.set(.f12, pcStyle("\x1b[24;{}~") ++ .{Entry{ .sequence = "\x1B[24~" }});
 
     // Keypad keys
-    result.set(.numpad_0, kpKeys("p"));
-    result.set(.numpad_1, kpKeys("q"));
-    result.set(.numpad_2, kpKeys("r"));
-    result.set(.numpad_3, kpKeys("s"));
-    result.set(.numpad_4, kpKeys("t"));
-    result.set(.numpad_5, kpKeys("u"));
-    result.set(.numpad_6, kpKeys("v"));
-    result.set(.numpad_7, kpKeys("w"));
-    result.set(.numpad_8, kpKeys("x"));
-    result.set(.numpad_9, kpKeys("y"));
-    result.set(.numpad_decimal, kpKeys("n"));
-    result.set(.numpad_divide, kpKeys("o"));
-    result.set(.numpad_multiply, kpKeys("j"));
-    result.set(.numpad_subtract, kpKeys("m"));
-    result.set(.numpad_add, kpKeys("k"));
-    result.set(.numpad_enter, kpKeys("M") ++ .{Entry{ .sequence = "\r" }});
+    result.set(.numpad_0, kpKeys("p", "0"));
+    result.set(.numpad_1, kpKeys("q", "1"));
+    result.set(.numpad_2, kpKeys("r", "2"));
+    result.set(.numpad_3, kpKeys("s", "3"));
+    result.set(.numpad_4, kpKeys("t", "4"));
+    result.set(.numpad_5, kpKeys("u", "5"));
+    result.set(.numpad_6, kpKeys("v", "6"));
+    result.set(.numpad_7, kpKeys("w", "7"));
+    result.set(.numpad_8, kpKeys("x", "8"));
+    result.set(.numpad_9, kpKeys("y", "9"));
+    result.set(.numpad_decimal, kpKeys("n", "."));
+    result.set(.numpad_divide, kpKeys("o", "/"));
+    result.set(.numpad_multiply, kpKeys("j", "*"));
+    result.set(.numpad_subtract, kpKeys("m", "-"));
+    result.set(.numpad_add, kpKeys("k", "+"));
+    result.set(.numpad_enter, kpKeys("M", "\r"));
     result.set(.numpad_up, pcStyle("\x1b[1;{}A") ++ cursorKey("\x1b[A", "\x1bOA"));
     result.set(.numpad_down, pcStyle("\x1b[1;{}B") ++ cursorKey("\x1b[B", "\x1bOB"));
     result.set(.numpad_right, pcStyle("\x1b[1;{}C") ++ cursorKey("\x1b[C", "\x1bOC"));
@@ -258,10 +258,12 @@ fn kpDefault(comptime suffix: []const u8) []const Entry {
 
 /// Returns the entries for a keypad key. The suffix is the final character
 /// of the sent sequence, such as "r" for kp_2.
-fn kpKeys(comptime suffix: []const u8) []const Entry {
+fn kpKeys(comptime suffix: []const u8, comptime normal: []const u8) []const Entry {
     const pc = pcStyle("\x1bO{}" ++ suffix);
     for (pc) |*entry| entry.keypad = .application;
-    return kpDefault(suffix) ++ pc;
+    return kpDefault(suffix) ++ pc ++ .{
+        Entry{ .keypad = .normal, .sequence = normal },
+    };
 }
 
 /// Returns entries that are dependent on cursor key settings.
