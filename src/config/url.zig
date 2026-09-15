@@ -161,6 +161,14 @@ const scheme_url_branch =
     "(?:" ++ ipv6_url_pattern ++ "|" ++ scheme_url_chars ++ "+" ++ optional_bracketed_word_suffix ++ ")+" ++
     no_trailing_punctuation;
 
+// Local development servers commonly print a host and port without a scheme.
+// Keep the boundary strict so email addresses and lookalike hosts do not become
+// local links. The application chooses the HTTP scheme when opening the match.
+const localhost_port_branch =
+    \\(?<![\w.@:/-])(?i:(?:[a-z0-9-]+\.)*localhost):[0-9]+(?![\w@:.])
+++ "(?:[/?#]" ++ scheme_url_chars ++ "*" ++ optional_bracketed_word_suffix ++ ")?" ++
+    no_trailing_punctuation;
+
 const rooted_or_relative_path_prefix =
     \\(?:\.\.\/|\.\/|(?<!\w)~\/|(?:[\w][\w\-.]*\/)*(?<!\w)\$[A-Za-z_]\w*\/|\.[\w][\w\-.]*\/|(?<![\w~\/])\/(?!\/))
 ;
@@ -218,7 +226,7 @@ const bare_relative_path_branch =
     no_trailing_colon ++
     trailing_spaces_at_eol;
 
-pub const scheme_regex = scheme_url_branch;
+pub const scheme_regex = scheme_url_branch ++ "|" ++ localhost_port_branch;
 
 pub const path_regex =
     rooted_or_relative_path_branch ++
