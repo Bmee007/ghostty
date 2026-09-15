@@ -227,6 +227,38 @@ pub const path_regex =
 
 pub const regex = scheme_regex ++ "|" ++ path_regex;
 
+test "url regex bare localhost ports" {
+    const testing = std.testing;
+    try oni.testing.ensureInit();
+    var re = try oni.Regex.init(scheme_regex, .{}, oni.Encoding.utf8, oni.Syntax.default, null);
+    defer re.deinit();
+
+    for ([_][]const u8{
+        "localhost:8000",
+        "localhost:8000/probe?encoded=a%2Fb&duplicate=1&duplicate=2#fragment",
+        "api.localhost:8000/path",
+        "LOCALHOST:8000",
+    }) |value| {
+        var reg = try re.search(value, .{});
+        defer reg.deinit();
+        const match = value[@intCast(reg.starts()[0])..@intCast(reg.ends()[0])];
+        try testing.expectEqualStrings(value, match);
+    }
+
+    for ([_][]const u8{
+        "notlocalhost:8000",
+        "localhost.evil.example:8000",
+        "user@localhost:8000",
+        "localhost:8000suffix",
+    }) |value| {
+        var result = re.search(value, .{});
+        if (result) |*reg| {
+            reg.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
 test "url regex" {
     const testing = std.testing;
 
