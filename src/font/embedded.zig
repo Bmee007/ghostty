@@ -30,6 +30,9 @@ pub const arabic = @embedFile("res/KawkabMono-Regular.ttf");
 /// A D2Coding subset with modern Hangul syllables but no conjoining jamo.
 pub const hangul_test = @embedFile("res/GhosttyHangulTest.ttf");
 
+/// A Source Han Mono subset with syllables and conjoining jamo.
+pub const hangul_jamo_test = @embedFile("res/GhosttyHangulJamoTest.otf");
+
 /// A font for testing which is patched with nerd font symbols.
 pub const test_nerd_font = @embedFile("res/JetBrainsMonoNerdFont-Regular.ttf");
 

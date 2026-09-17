@@ -37,6 +37,15 @@ This project uses several fonts which fall under the SIL Open Font License (OFL-
     U+C81C, U+D55C and U+BC95, all name records, and default subset options.
     Name IDs 1, 3, 4, 6 and 16 were renamed to `Ghostty Hangul Test`;
     ID 17 was renamed to `Regular`. No conjoining jamo are present.
+- Ghostty Hangul Jamo Test (OFL-1.1)
+  - Subset of Source Han Mono K Regular from [Source Han Mono 1.002](https://github.com/adobe-fonts/source-han-mono/releases/tag/1.002).
+  - Copyright 2014–2019 Adobe. Full license: [SourceHanMono-OFL.txt](./SourceHanMono-OFL.txt).
+  - Generated with fontTools 4.60.2, retaining U+0020–U+007E, U+BB34,
+    U+C81C, U+D55C, U+BC95 and their modern conjoining jamo, all name
+    records, and default subset options. Name IDs 1, 3, 4 and 16 were renamed
+    to `Ghostty Hangul Jamo Test`, ID 6 to `GhosttyHangulJamoTest`, and ID 17
+    to `Regular`. CFF family, full, PostScript and FD font names were renamed
+    with the same `Ghostty Hangul Jamo Test` / `GhosttyHangulJamoTest` names.
 
 A full copy of the OFL license can be found at [OFL.txt](./OFL.txt).
 An accompanying FAQ is also available at <https://openfontlicense.org/>.
