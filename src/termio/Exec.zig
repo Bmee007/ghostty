@@ -1458,7 +1458,7 @@ fn exportGhosttyBinEnv(
         log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
         return;
     };
-    const ghostty_bin = resolved;
+    const ghostty_bin = try alloc.dupe(u8, resolved);
     const bin_dir = std.fs.path.dirname(ghostty_bin) orelse return;
     log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
 
