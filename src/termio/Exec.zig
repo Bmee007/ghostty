@@ -22,7 +22,6 @@ const shell_integration = @import("shell_integration.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
 const Command = @import("../Command.zig");
-const SegmentedPool = @import("../datastruct/main.zig").SegmentedPool;
 const ptypkg = @import("../pty.zig");
 const Pty = ptypkg.Pty;
 const EnvMap = std.process.Environ.Map;
@@ -418,8 +417,9 @@ pub fn queueWrite(
     // our cached buffers that we can queue to the stream.
     var i: usize = 0;
     while (i < data.len) {
-        const req = try exec.write_req_pool.getGrow(alloc);
-        const buf = try exec.write_buf_pool.getGrow(alloc);
+        const w = try exec.write_pool.create(alloc);
+        w.td = exec;
+        const buf = &w.buf;
         const slice = slice: {
             // The maximum end index is either the end of our data or
             // the end of our buffer, whichever is smaller.
@@ -459,26 +459,25 @@ pub fn queueWrite(
         exec.write_stream.queueWrite(
             td.loop,
             &exec.write_queue,
-            req,
+            &w.req,
             .{ .slice = slice },
-            termio.Exec.ThreadData,
-            exec,
+            ThreadData.Write,
+            w,
             ttyWrite,
         );
     }
 }
 
 fn ttyWrite(
-    td_: ?*ThreadData,
+    w_: ?*ThreadData.Write,
     _: *xev.Loop,
     _: *xev.Completion,
     _: xev.Stream,
     _: xev.WriteBuffer,
     r: xev.WriteError!usize,
 ) xev.CallbackAction {
-    const td = td_.?;
-    td.write_req_pool.put();
-    td.write_buf_pool.put();
+    const w = w_.?;
+    w.td.write_pool.destroy(w);
 
     const d = r catch |err| {
         log.err("write error: {}", .{err});
@@ -492,9 +491,21 @@ fn ttyWrite(
 
 /// The thread local data for the exec implementation.
 pub const ThreadData = struct {
-    // The preallocation size for the write request pool. This should be big
-    // enough to satisfy most write requests. It must be a power of 2.
-    const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
+    /// The state for a single queued pty write. The write request and
+    /// the buffer it writes from must both remain pointer-stable until
+    /// the write completes, so they're pooled together and checked out
+    /// per write.
+    pub const Write = struct {
+        /// Backpointer to the thread data so the write completion
+        /// callback can put this back into the pool.
+        td: *ThreadData,
+
+        /// The libxev write request.
+        req: xev.WriteRequest,
+
+        /// The buffer for the data being written.
+        buf: [64]u8,
+    };
 
     /// Process start time and boolean of whether its already exited.
     start: std.Io.Timestamp,
@@ -506,12 +517,9 @@ pub const ThreadData = struct {
     /// The process watcher
     process: ?xev.Process,
 
-    /// This is the pool of available (unused) write requests. If you grab
+    /// This is the pool of available (unused) write states. If you grab
     /// one from the pool, you must put it back when you're done!
-    write_req_pool: SegmentedPool(xev.WriteRequest, WRITE_REQ_PREALLOC) = .{},
-
-    /// The pool of available buffers for writing to the pty.
-    write_buf_pool: SegmentedPool([64]u8, WRITE_REQ_PREALLOC) = .{},
+    write_pool: std.heap.MemoryPool(Write) = .empty,
 
     /// The write queue for the data stream.
     write_queue: xev.WriteQueue = .{},
@@ -541,11 +549,10 @@ pub const ThreadData = struct {
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         _ = posix.system.close(self.read_thread_pipe);
 
-        // Clear our write pools. We know we aren't ever going to do
+        // Clear our write pool. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
         // drop this.
-        self.write_req_pool.deinit(alloc);
-        self.write_buf_pool.deinit(alloc);
+        self.write_pool.deinit(alloc);
 
         // Stop our process watcher
         if (self.process) |*p| p.deinit();
@@ -683,36 +690,7 @@ const Subprocess = struct {
                 log.warn("failed to get ghostty exe path err={}", .{err});
                 break :ghostty_path;
             }];
-            const ghostty_bin = resolveGhosttyBin(&env, exe_bin_path) orelse {
-                log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
-                break :ghostty_path;
-            };
-            const bin_dir = std.fs.path.dirname(ghostty_bin) orelse break :ghostty_path;
-            log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
-
-            // Always export both forms so shell integration keeps an exact CLI
-            // path even if the shell later overwrites PATH. GHOSTTY_BIN_DIR is
-            // retained for the separate shell-integration `path` feature.
-            try env.put("GHOSTTY_BIN", ghostty_bin);
-            try env.put("GHOSTTY_BIN_DIR", bin_dir);
-
-            // Append if we have a path. We want to append so that ghostty is
-            // the last priority in the path. If we don't have a path set
-            // then we just set it to the directory of the binary.
-            if (env.get("PATH")) |path| {
-                // Verify that our path doesn't already contain this entry
-                var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
-                while (it.next()) |entry| {
-                    if (std.mem.eql(u8, entry, bin_dir)) break :ghostty_path;
-                }
-
-                try env.put(
-                    "PATH",
-                    try appendEnv(alloc, path, bin_dir),
-                );
-            } else {
-                try env.put("PATH", bin_dir);
-            }
+            try exportGhosttyBinEnv(alloc, &env, exe_bin_path);
         }
 
         // On macOS, export additional data directories from our
@@ -1464,6 +1442,83 @@ const Subprocess = struct {
 
 /// Resolve the CLI executable used by shell integration. Native Ghostty owns
 /// its executable path; embedded hosts can supply a distinct helper path.
+/// Exports the exact Ghostty CLI path and adds its directory to PATH.
+///
+/// Embedded runtimes may provide a helper that doesn't live beside the host
+/// executable, so shell integration must not reconstruct this path by
+/// appending a hardcoded executable name to selfExePath's directory. The
+/// resolved path can alias the map's own `GHOSTTY_BIN` value, and putting
+/// that key frees the old value, so the path is copied first.
+fn exportGhosttyBinEnv(
+    alloc: Allocator,
+    env: *EnvMap,
+    self_exe_path: []const u8,
+) !void {
+    const resolved = resolveGhosttyBin(env, self_exe_path) orelse {
+        log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
+        return;
+    };
+    const ghostty_bin = try alloc.dupe(u8, resolved);
+    const bin_dir = std.fs.path.dirname(ghostty_bin) orelse return;
+    log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
+
+    // Always export both forms so shell integration keeps an exact CLI
+    // path even if the shell later overwrites PATH. GHOSTTY_BIN_DIR is
+    // retained for the separate shell-integration `path` feature.
+    try env.put("GHOSTTY_BIN", ghostty_bin);
+    try env.put("GHOSTTY_BIN_DIR", bin_dir);
+
+    // Append if we have a path. We want to append so that ghostty is
+    // the last priority in the path. If we don't have a path set
+    // then we just set it to the directory of the binary.
+    if (env.get("PATH")) |path| {
+        // Verify that our path doesn't already contain this entry
+        var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry, bin_dir)) return;
+        }
+
+        try env.put(
+            "PATH",
+            try appendEnv(alloc, path, bin_dir),
+        );
+    } else {
+        try env.put("PATH", bin_dir);
+    }
+}
+
+test "exportGhosttyBinEnv keeps an embedded GHOSTTY_BIN intact" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // The env map owns its strings with an allocator that poisons freed
+    // memory, like the surface allocator in the app.
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("GHOSTTY_BIN", "/Applications/cmux.app/Contents/Resources/bin/ghostty");
+    try env.put("PATH", "/usr/bin:/bin");
+
+    try exportGhosttyBinEnv(
+        arena.allocator(),
+        &env,
+        "/Applications/cmux.app/Contents/MacOS/cmux",
+    );
+
+    try testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin/ghostty",
+        env.get("GHOSTTY_BIN").?,
+    );
+    try testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin",
+        env.get("GHOSTTY_BIN_DIR").?,
+    );
+    try testing.expectEqualStrings(
+        "/usr/bin:/bin:/Applications/cmux.app/Contents/Resources/bin",
+        env.get("PATH").?,
+    );
+}
+
 fn resolveGhosttyBin(env: *const EnvMap, self_exe_path: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, std.fs.path.basename(self_exe_path), "ghostty")) {
         return self_exe_path;
