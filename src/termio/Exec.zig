@@ -690,36 +690,7 @@ const Subprocess = struct {
                 log.warn("failed to get ghostty exe path err={}", .{err});
                 break :ghostty_path;
             }];
-            const ghostty_bin = resolveGhosttyBin(&env, exe_bin_path) orelse {
-                log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
-                break :ghostty_path;
-            };
-            const bin_dir = std.fs.path.dirname(ghostty_bin) orelse break :ghostty_path;
-            log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
-
-            // Always export both forms so shell integration keeps an exact CLI
-            // path even if the shell later overwrites PATH. GHOSTTY_BIN_DIR is
-            // retained for the separate shell-integration `path` feature.
-            try env.put("GHOSTTY_BIN", ghostty_bin);
-            try env.put("GHOSTTY_BIN_DIR", bin_dir);
-
-            // Append if we have a path. We want to append so that ghostty is
-            // the last priority in the path. If we don't have a path set
-            // then we just set it to the directory of the binary.
-            if (env.get("PATH")) |path| {
-                // Verify that our path doesn't already contain this entry
-                var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
-                while (it.next()) |entry| {
-                    if (std.mem.eql(u8, entry, bin_dir)) break :ghostty_path;
-                }
-
-                try env.put(
-                    "PATH",
-                    try appendEnv(alloc, path, bin_dir),
-                );
-            } else {
-                try env.put("PATH", bin_dir);
-            }
+            try exportGhosttyBinEnv(alloc, &env, exe_bin_path);
         }
 
         // On macOS, export additional data directories from our
@@ -1471,6 +1442,83 @@ const Subprocess = struct {
 
 /// Resolve the CLI executable used by shell integration. Native Ghostty owns
 /// its executable path; embedded hosts can supply a distinct helper path.
+/// Exports the exact Ghostty CLI path and adds its directory to PATH.
+///
+/// Embedded runtimes may provide a helper that doesn't live beside the host
+/// executable, so shell integration must not reconstruct this path by
+/// appending a hardcoded executable name to selfExePath's directory. The
+/// resolved path can alias the map's own `GHOSTTY_BIN` value, and putting
+/// that key frees the old value, so the path is copied first.
+fn exportGhosttyBinEnv(
+    alloc: Allocator,
+    env: *EnvMap,
+    self_exe_path: []const u8,
+) !void {
+    const resolved = resolveGhosttyBin(env, self_exe_path) orelse {
+        log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
+        return;
+    };
+    const ghostty_bin = resolved;
+    const bin_dir = std.fs.path.dirname(ghostty_bin) orelse return;
+    log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
+
+    // Always export both forms so shell integration keeps an exact CLI
+    // path even if the shell later overwrites PATH. GHOSTTY_BIN_DIR is
+    // retained for the separate shell-integration `path` feature.
+    try env.put("GHOSTTY_BIN", ghostty_bin);
+    try env.put("GHOSTTY_BIN_DIR", bin_dir);
+
+    // Append if we have a path. We want to append so that ghostty is
+    // the last priority in the path. If we don't have a path set
+    // then we just set it to the directory of the binary.
+    if (env.get("PATH")) |path| {
+        // Verify that our path doesn't already contain this entry
+        var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry, bin_dir)) return;
+        }
+
+        try env.put(
+            "PATH",
+            try appendEnv(alloc, path, bin_dir),
+        );
+    } else {
+        try env.put("PATH", bin_dir);
+    }
+}
+
+test "exportGhosttyBinEnv keeps an embedded GHOSTTY_BIN intact" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // The env map owns its strings with an allocator that poisons freed
+    // memory, like the surface allocator in the app.
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("GHOSTTY_BIN", "/Applications/cmux.app/Contents/Resources/bin/ghostty");
+    try env.put("PATH", "/usr/bin:/bin");
+
+    try exportGhosttyBinEnv(
+        arena.allocator(),
+        &env,
+        "/Applications/cmux.app/Contents/MacOS/cmux",
+    );
+
+    try testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin/ghostty",
+        env.get("GHOSTTY_BIN").?,
+    );
+    try testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin",
+        env.get("GHOSTTY_BIN_DIR").?,
+    );
+    try testing.expectEqualStrings(
+        "/usr/bin:/bin:/Applications/cmux.app/Contents/Resources/bin",
+        env.get("PATH").?,
+    );
+}
+
 fn resolveGhosttyBin(env: *const EnvMap, self_exe_path: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, std.fs.path.basename(self_exe_path), "ghostty")) {
         return self_exe_path;
