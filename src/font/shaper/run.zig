@@ -9,6 +9,10 @@ const autoHash = std.hash.autoHash;
 const Hasher = std.hash.Wyhash;
 const VisualRun = itijah.VisualRun;
 
+test {
+    _ = @import("hangul_test.zig");
+}
+
 /// Classify a codepoint by bidi strength.
 /// Returns null for neutrals (spaces/punctuation).
 fn codepointIsRtl(cp: u32) ?bool {
