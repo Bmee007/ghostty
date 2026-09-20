@@ -5393,7 +5393,11 @@ pub fn scrollCallback(
         // The tracked copy cursor owns wheel navigation for this surface.
         // Keep the program's DEC modes intact so exiting copy mode restores
         // its input, and retain Ghostty's normal delta scaling above.
-        const copy_mode = self.keyboard_copy_cursor != null;
+        const copy_mode = if (self.keyboard_copy_cursor) |cursor| blk: {
+            const screens = &self.io.terminal.screens;
+            break :blk cursor.screen_key == screens.active_key and
+                cursor.screen_generation == screens.generation(screens.active_key);
+        } else false;
 
         // If we have an active mouse reporting mode, clear the selection.
         // The selection can occur if the user uses the shift mod key to
