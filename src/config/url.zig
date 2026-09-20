@@ -258,6 +258,7 @@ test "url regex bare localhost ports" {
         "localhost.evil.example:8000",
         "user@localhost:8000",
         "localhost:8000suffix",
+        "localhost:8000.evil",
     }) |value| {
         var result = re.search(value, .{});
         if (result) |*reg| {
@@ -265,6 +266,14 @@ test "url regex bare localhost ports" {
             return error.TestUnexpectedResult;
         } else |_| {}
     }
+
+    const punctuated = "localhost:8000.";
+    var reg = try re.search(punctuated, .{});
+    defer reg.deinit();
+    try testing.expectEqualStrings(
+        "localhost:8000",
+        punctuated[@intCast(reg.starts()[0])..@intCast(reg.ends()[0])],
+    );
 }
 
 test "url regex" {
