@@ -17,10 +17,22 @@ The test needs Xcode command-line tools and Python 3. It does not launch a GUI o
 write user configuration. Core dumps are disabled for the subprocesses.
 
 Snapshot ownership, retained views, empty environments, and allocation failures
-are also covered by `src/os/EnvironSnapshots.zig` in the regular Zig tests:
+are also covered by four tests in `src/os/EnvironSnapshots.zig`. Run only those
+tests without building the full Ghostty test target:
 
 ```sh
-zig build test -Dtest-filter=EnvironSnapshots -Demit-macos-app=false -Dsentry=false
+zig test src/os/EnvironSnapshots.zig
+```
+
+On POSIX systems, the output should end with `All 4 tests passed.`
+
+The tests are also included in the regular Zig test target. Zig matches filters
+against fully qualified test names, which include `os.EnvironSnapshots.test.`,
+so the module name selects these tests even though their declarations use
+descriptive names:
+
+```sh
+zig build test -Dtest-filter=EnvironSnapshots -Demit-macos-app=false -Dsentry=false --summary all
 ```
 
 The snapshot protects reads after initialization from later host environment
