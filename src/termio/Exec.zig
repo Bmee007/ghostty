@@ -29,6 +29,33 @@ const PasswdEntry = internal_os.passwd.Entry;
 const windows = internal_os.windows;
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
 
+const PROC_PIDTBSDINFO = 3;
+const proc_bsdinfo = extern struct {
+    pbi_flags: u32,
+    pbi_status: u32,
+    pbi_xstatus: u32,
+    pbi_pid: u32,
+    pbi_ppid: u32,
+    pbi_uid: u32,
+    pbi_gid: u32,
+    pbi_ruid: u32,
+    pbi_rgid: u32,
+    pbi_svuid: u32,
+    pbi_svgid: u32,
+    rfu_1: u32,
+    pbi_comm: [16]u8,
+    pbi_name: [32]u8,
+    pbi_nfiles: u32,
+    pbi_pgid: u32,
+    pbi_pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    pbi_nice: i32,
+    pbi_start_tvsec: u64,
+    pbi_start_tvusec: u64,
+};
+extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
+
 const log = std.log.scoped(.io_exec);
 
 /// The termios poll rate in milliseconds.
@@ -590,6 +617,8 @@ const Subprocess = struct {
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
     process: ?Process = null,
+    launch_identity_mutex: std.Thread.Mutex = .{},
+    launch_identity: ?ptypkg.LaunchIdentity = null,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -1021,10 +1050,10 @@ const Subprocess = struct {
                     const f = struct {
                         fn callback(cmd: *Command) ?u8 {
                             const sp = cmd.getData(Subprocess) orelse unreachable;
-                            sp.childPreExec() catch |err| log.err(
-                                "error initializing child: {}",
-                                .{err},
-                            );
+                            sp.childPreExec() catch |err| {
+                                log.err("error initializing child: {}", .{err});
+                                return 126;
+                            };
                             return null;
                         }
                     };
@@ -1058,6 +1087,7 @@ const Subprocess = struct {
         };
         log.info("started subcommand path={s} pid={?}", .{ self.args[0], cmd.pid });
 
+        self.publishLaunchIdentity(cmd.launch_identity);
         self.process = .{ .fork_exec = cmd };
         return switch (builtin.os.tag) {
             .windows => .{
@@ -1070,6 +1100,35 @@ const Subprocess = struct {
                 .write = pty.master,
             },
         };
+    }
+
+    fn processBsdInfo(pid: u64) ?proc_bsdinfo {
+        if (comptime builtin.os.tag != .macos) return null;
+        var info: proc_bsdinfo = std.mem.zeroes(proc_bsdinfo);
+        const rc = proc_pidinfo(@intCast(pid), PROC_PIDTBSDINFO, 0, &info, @intCast(@sizeOf(proc_bsdinfo)));
+        if (rc != @sizeOf(proc_bsdinfo)) return null;
+        return info;
+    }
+
+    fn reobserveLaunchIdentity(identity: ptypkg.LaunchIdentity) ?ptypkg.LaunchIdentity {
+        const info = processBsdInfo(identity.pid) orelse return null;
+        const observed_start_token = info.pbi_start_tvsec *% 1_000_000 +% info.pbi_start_tvusec;
+        if (observed_start_token != identity.start_token) return null;
+        if (info.pbi_pgid != identity.pgid) return null;
+        return identity;
+    }
+
+    fn publishLaunchIdentity(self: *Subprocess, identity: ?ptypkg.LaunchIdentity) void {
+        self.launch_identity_mutex.lock();
+        defer self.launch_identity_mutex.unlock();
+        self.launch_identity = identity;
+    }
+
+    fn frozenLaunchIdentity(self: *Subprocess) ?ptypkg.LaunchIdentity {
+        self.launch_identity_mutex.lock();
+        defer self.launch_identity_mutex.unlock();
+        const identity = self.launch_identity orelse return null;
+        return reobserveLaunchIdentity(identity);
     }
 
     /// This should be called after fork but before exec in the child process.
@@ -1235,6 +1294,10 @@ const Subprocess = struct {
     /// Returns `null` if there was an error getting the information or the
     /// information is not available on a particular platform.
     pub fn getProcessInfo(self: *Subprocess, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+        // The immutable launch identity is owned by the fork owner (Command), not the PTY.
+        // Serve only the synchronized frozen copy published after exec-success. Do not read
+        // live Subprocess.process state here; this getter can be called from any thread.
+        if (info == .launch_identity) return self.frozenLaunchIdentity();
         const pty = &(self.pty orelse return null);
         return pty.getProcessInfo(info);
     }

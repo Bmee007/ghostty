@@ -1787,6 +1787,33 @@ pub const CAPI = struct {
         return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
     }
 
+    const ghostty_launch_identity_s = extern struct {
+        valid: bool,
+        pid: u64,
+        pgid: u64,
+        start_token: u64,
+    };
+
+    /// Returns the immutable launch identity for the direct child spawned as the surface's
+    /// initial command. valid=false means no atomically-published identity is available and
+    /// the caller MUST fail closed. Unlike ghostty_surface_foreground_pid this is not a
+    /// mutable foreground-process-group observation: pid, pgid, and start_token describe one
+    /// immutable process incarnation captured by the fork owner at process birth.
+    export fn ghostty_surface_launch_identity(surface: *Surface) ghostty_launch_identity_s {
+        const identity = surface.core_surface.getProcessInfo(.launch_identity) orelse return .{
+            .valid = false,
+            .pid = 0,
+            .pgid = 0,
+            .start_token = 0,
+        };
+        return .{
+            .valid = true,
+            .pid = identity.pid,
+            .pgid = identity.pgid,
+            .start_token = identity.start_token,
+        };
+    }
+
     /// Returns the PTY name for the surface. The returned string must be
     /// freed by the caller via ghostty_string_free.
     export fn ghostty_surface_tty_name(surface: *Surface) String {

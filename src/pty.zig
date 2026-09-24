@@ -36,17 +36,32 @@ pub const Mode = packed struct {
     echo: bool = true,
 };
 
+/// Immutable launch identity for the direct child spawned for a surface, captured by the
+/// component that owns fork (Command.zig) at process birth. pid, pgid, and start_token
+/// describe one immutable process incarnation; start_token is a PID-reuse-resistant Darwin
+/// process-birth token. This is distinct from foreground_pid, which is a mutable
+/// foreground-process-group observation and must never be used as launch authority.
+pub const LaunchIdentity = struct {
+    pid: u64,
+    pgid: u64,
+    start_token: u64,
+};
+
 pub const ProcessInfo = enum {
     /// The PID of the process that controls the PTY.
     foreground_pid,
     /// Gets the name of the slave PTY. Returned name points to an internal buffer
     /// so it should not be modified or freed.
     tty_name,
+    /// The immutable launch identity of the direct child (see LaunchIdentity). Served by the
+    /// subprocess (the fork owner), not the PTY.
+    launch_identity,
 
     pub fn Type(comptime info: ProcessInfo) type {
         return switch (info) {
             .foreground_pid => u64,
             .tty_name => [:0]const u8,
+            .launch_identity => LaunchIdentity,
         };
     }
 };
@@ -269,6 +284,9 @@ const PosixPty = struct {
     /// is not available on a particular platform.
     pub fn getProcessInfo(self: *PosixPty, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
         return switch (info) {
+            // Never reached: the subprocess (fork owner) serves launch_identity before it
+            // ever delegates to the PTY. Present so the enum switch stays exhaustive.
+            .launch_identity => null,
             .foreground_pid => {
                 switch (builtin.os.tag) {
                     .linux => {

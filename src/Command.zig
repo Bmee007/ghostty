@@ -32,6 +32,7 @@ const Allocator = std.mem.Allocator;
 const File = std.fs.File;
 const EnvMap = std.process.EnvMap;
 const apprt = @import("apprt.zig");
+const pty_pkg = @import("pty.zig");
 
 /// Function prototype for a function executed /in the child process/ after the
 /// fork, but before exec'ing the command. If the function returns a u8, the
@@ -41,6 +42,10 @@ const PreExecFn = fn (*Command) ?u8;
 /// Allowable set of errors that can be returned by a post fork function. Any
 /// errors will result in the failure to create the surface.
 pub const PostForkError = error{PostForkError};
+
+/// The child failed before exec completed the post-fork/pre-exec setup required
+/// for an authoritative launch identity.
+pub const ChildSetupError = error{ChildSetupFailed};
 
 /// Function prototype for a function executed /in the parent process/
 /// after the fork.
@@ -108,6 +113,13 @@ data: ?*anyopaque = null,
 /// Process ID is set after start is called.
 pid: ?posix.pid_t = null,
 
+/// Immutable launch identity captured at fork (see pty.LaunchIdentity). Set exactly once in
+/// the parent only after the child confirms successful post-fork/pre-exec setup by reaching
+/// exec, before start() returns; never mutated afterward. Null when capture is unavailable
+/// (non-macOS, a failed process-birth query, or child setup/exec failure), which makes the C
+/// ABI boundary fail closed rather than publish an unverified identity.
+launch_identity: ?pty_pkg.LaunchIdentity = null,
+
 /// The various methods a process may exit.
 pub const Exit = if (builtin.os.tag == .windows) union(enum) {
     Exited: u32,
@@ -154,6 +166,77 @@ pub const RtPostForkInfo = if (@hasDecl(apprt.runtime, "post_fork")) apprt.runti
     }
 };
 
+const child_exec_failure: u8 = 0xE7;
+const child_exec_deadline_ms: i32 = 10_000;
+
+// libproc (Darwin) ABI for capturing an immutable process-birth token. std.c in the pinned
+// zig does not expose these, so we declare the minimal surface we use. proc_pidinfo is called
+// in the parent after the child confirms successful terminal setup, while the child is
+// unwaited and its PID therefore cannot be recycled -- so the captured token is an immutable,
+// PID-reuse-resistant identity.
+const PROC_PIDTBSDINFO = 3;
+const proc_bsdinfo = extern struct {
+    pbi_flags: u32,
+    pbi_status: u32,
+    pbi_xstatus: u32,
+    pbi_pid: u32,
+    pbi_ppid: u32,
+    pbi_uid: u32,
+    pbi_gid: u32,
+    pbi_ruid: u32,
+    pbi_rgid: u32,
+    pbi_svuid: u32,
+    pbi_svgid: u32,
+    rfu_1: u32,
+    pbi_comm: [16]u8,
+    pbi_name: [32]u8,
+    pbi_nfiles: u32,
+    pbi_pgid: u32,
+    pbi_pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    pbi_nice: i32,
+    pbi_start_tvsec: u64,
+    pbi_start_tvusec: u64,
+};
+extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
+
+fn processBsdInfo(pid: posix.pid_t) ?proc_bsdinfo {
+    if (comptime builtin.os.tag != .macos) return null;
+    var info: proc_bsdinfo = std.mem.zeroes(proc_bsdinfo);
+    const rc = proc_pidinfo(@intCast(pid), PROC_PIDTBSDINFO, 0, &info, @intCast(@sizeOf(proc_bsdinfo)));
+    if (rc != @sizeOf(proc_bsdinfo)) return null;
+    return info;
+}
+
+fn startTokenFromInfo(info: proc_bsdinfo) u64 {
+    return info.pbi_start_tvsec *% 1_000_000 +% info.pbi_start_tvusec;
+}
+
+fn captureLaunchIdentityStartToken(_: *Command, pid: posix.pid_t) ?u64 {
+    const info = processBsdInfo(pid) orelse return null;
+    const start_token = startTokenFromInfo(info);
+    return if (start_token == 0) null else start_token;
+}
+
+/// Capture the immutable launch identity of the just-forked child. Called in the parent
+/// after the child reaches exec with successful post-fork/pre-exec setup and before start()
+/// returns. The parent captured the birth token immediately after fork; after exec-success EOF
+/// we re-capture it and require equality, then observe pgid only after child setup is complete.
+/// If any field is unavailable or contradictory, identity is left null so the C ABI fails closed.
+fn captureLaunchIdentity(self: *Command, pid: posix.pid_t, fork_start_token: u64) void {
+    const start_token = fork_start_token;
+    const info = processBsdInfo(pid) orelse return;
+    const confirmed_start_token = startTokenFromInfo(info);
+    if (confirmed_start_token == 0 or fork_start_token == 0 or start_token != confirmed_start_token) return;
+    if (info.pbi_pgid == 0 or info.pbi_pgid != @as(u32, @intCast(pid))) return;
+    self.launch_identity = .{
+        .pid = @intCast(pid),
+        .pgid = @intCast(info.pbi_pgid),
+        .start_token = confirmed_start_token,
+    };
+}
+
 /// Start the subprocess. This returns immediately once the child is started.
 ///
 /// After this is successful, self.pid is available.
@@ -173,6 +256,13 @@ pub fn start(self: *Command, alloc: Allocator) !void {
 }
 
 fn startPosix(self: *Command, arena: Allocator) !void {
+    var setup_pipe = try internal_os.pipe();
+    errdefer {
+        closeFdIfOpen(&setup_pipe[0]);
+        closeFdIfOpen(&setup_pipe[1]);
+    }
+    try ensureFdOutsideStdio(&setup_pipe[1]);
+
     // Null-terminate all our arguments
     const argsZ = try arena.allocSentinel(?[*:0]const u8, self.args.len, null);
     for (self.args, 0..) |arg, i| argsZ[i] = arg.ptr;
@@ -189,21 +279,32 @@ fn startPosix(self: *Command, arena: Allocator) !void {
     const pid = try posix.fork();
 
     if (pid != 0) {
-        // Parent, return immediately.
+        // Parent: publish no launch identity until the child reaches exec. The report pipe
+        // write end is close-on-exec; success is a clean EOF. Any child-side setup/exec
+        // failure writes a failure byte before exiting and fails the launch closed.
+        closeFdIfOpen(&setup_pipe[1]);
         self.pid = @intCast(pid);
+        const fork_start_token = self.captureLaunchIdentityStartToken(@intCast(pid));
+        self.waitForChildExecOutcome(setup_pipe[0], @intCast(pid)) catch |err| {
+            self.pid = null;
+            return err;
+        };
+        closeFdIfOpen(&setup_pipe[0]);
+        if (fork_start_token) |start_token| self.captureLaunchIdentity(@intCast(pid), start_token);
         if (self.rt_post_fork) |f| try f(self);
         return;
     }
 
     // We are the child.
+    closeFdIfOpen(&setup_pipe[0]);
 
     // Setup our file descriptors for std streams.
     if (self.stdin) |f| setupFd(f.handle, posix.STDIN_FILENO) catch
-        return error.ExecFailedInChild;
+        failChildExecOutcome(setup_pipe[1], 1);
     if (self.stdout) |f| setupFd(f.handle, posix.STDOUT_FILENO) catch
-        return error.ExecFailedInChild;
+        failChildExecOutcome(setup_pipe[1], 1);
     if (self.stderr) |f| setupFd(f.handle, posix.STDERR_FILENO) catch
-        return error.ExecFailedInChild;
+        failChildExecOutcome(setup_pipe[1], 1);
 
     // Setup our working directory
     if (self.cwd) |cwd| posix.chdir(cwd) catch {
@@ -218,17 +319,23 @@ fn startPosix(self: *Command, arena: Allocator) !void {
     // any failures are ignored (its best effort).
     global_state.rlimits.restore();
 
-    // If there are pre exec callbacks, call them now.
-    if (self.os_pre_exec) |f| if (f(self)) |exitcode| posix.exit(exitcode);
-    if (self.rt_pre_exec) |f| if (f(self)) |exitcode| posix.exit(exitcode);
+    // If there are pre exec callbacks, call them now. Callback failures are part of the
+    // exec-outcome protocol and must write a failure byte before the child exits.
+    if (self.os_pre_exec) |f| if (f(self)) |exitcode| failChildExecOutcome(setup_pipe[1], exitcode);
+    if (self.rt_pre_exec) |f| if (f(self)) |exitcode| failChildExecOutcome(setup_pipe[1], exitcode);
 
-    // Finally, replace our process.
+    // Finally, replace our process. The report pipe write end is CLOEXEC, so a successful
+    // exec writes nothing and the parent observes a clean EOF.
+
     // Note: we must use the "p"-variant of exec here because we
     // do not guarantee our command is looked up already in the path.
     const err = posix.execvpeZ(self.path, argsZ, envp);
 
-    // If we are executing this code, the exec failed. We're in the
-    // child process so there isn't much we can do. We try to output
+    // If we are executing this code, the exec failed. Report that failure before any stderr
+    // diagnostics so the parent fails the launch closed and never publishes a valid identity.
+    writeChildExecFailure(setup_pipe[1]) catch {};
+
+    // We're in the child process so there isn't much we can do. We try to output
     // something reasonable. Its important to note we MUST NOT return
     // any other error condition from here on out.
     var stderr_buf: [1024]u8 = undefined;
@@ -255,6 +362,63 @@ fn startPosix(self: *Command, arena: Allocator) !void {
     // We return a very specific error that can be detected to determine
     // we're in the child.
     return error.ExecFailedInChild;
+}
+
+fn closeFdIfOpen(fd: *posix.fd_t) void {
+    if (fd.* >= 0) {
+        posix.close(fd.*);
+        fd.* = -1;
+    }
+}
+
+fn ensureFdOutsideStdio(fd: *posix.fd_t) !void {
+    if (fd.* > posix.STDERR_FILENO) return;
+    const moved = try posix.fcntl(fd.*, posix.F.DUPFD_CLOEXEC, posix.STDERR_FILENO + 1);
+    posix.close(fd.*);
+    fd.* = @intCast(moved);
+}
+
+fn writeChildExecFailure(fd: posix.fd_t) !void {
+    var failure = [_]u8{child_exec_failure};
+    var offset: usize = 0;
+    while (offset < failure.len) {
+        const n = try posix.write(fd, failure[offset..]);
+        offset += n;
+    }
+}
+
+fn failChildExecOutcome(fd: posix.fd_t, exitcode: u8) noreturn {
+    writeChildExecFailure(fd) catch {};
+    posix.exit(exitcode);
+}
+
+fn killAndReapChild(pid: posix.pid_t) void {
+    posix.kill(pid, posix.SIG.KILL) catch {};
+    _ = posix.waitpid(pid, 0);
+}
+
+fn waitForChildExecOutcome(_: *Command, fd: posix.fd_t, pid: posix.pid_t) ChildSetupError!void {
+    var pollfds: [1]posix.pollfd = .{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    const ready = posix.poll(&pollfds, child_exec_deadline_ms) catch {
+        killAndReapChild(pid);
+        return error.ChildSetupFailed;
+    };
+    if (ready == 0) {
+        killAndReapChild(pid);
+        return error.ChildSetupFailed;
+    }
+
+    var outcome: [1]u8 = undefined;
+    const n = posix.read(fd, &outcome) catch {
+        killAndReapChild(pid);
+        return error.ChildSetupFailed;
+    };
+    if (n == 0) return;
+
+    // Any byte means setup/exec failed. Drain the child before failing closed so the caller
+    // cannot observe a valid identity for a process that never reached exec.
+    _ = posix.waitpid(pid, 0);
+    return error.ChildSetupFailed;
 }
 
 fn startWindows(self: *Command, arena: Allocator) !void {
@@ -866,6 +1030,33 @@ test "Command: custom working directory" {
 // Duplicating the test process leads to weird behavior
 // zig build test will hang
 // test binary created via -Demit-test-exe will run 2 copies of the test suite
+test "Command: posix child setup failure fails before launch identity publication" {
+    if (builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    }
+
+    const failPreExec = struct {
+        fn callback(_: *Command) ?u8 {
+            return 126;
+        }
+    }.callback;
+
+    var cmd: Command = .{
+        .path = "/bin/sh",
+        .args = &.{ "/bin/sh", "-c", "exit 0" },
+        .cwd = "/tmp",
+        .os_pre_exec = failPreExec,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+
+    try testing.expectError(error.ChildSetupFailed, cmd.testingStart());
+    try testing.expect(cmd.pid == null);
+    try testing.expect(cmd.launch_identity == null);
+}
+
 test "Command: posix fork handles execveZ failure" {
     if (builtin.os.tag == .windows) {
         return error.SkipZigTest;
@@ -890,11 +1081,39 @@ test "Command: posix fork handles execveZ failure" {
         .rt_post_fork_info = undefined,
     };
 
+    try testing.expectError(error.ChildSetupFailed, cmd.testingStart());
+    try testing.expect(cmd.pid == null);
+    try testing.expect(cmd.launch_identity == null);
+}
+
+// A successful exec writes nothing to the report pipe: close-on-exec produces the clean EOF
+// that authorizes immutable launch identity publication.
+test "Command: posix exec success clean EOF permits launch identity publication" {
+    if (builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    }
+
+    var cmd: Command = .{
+        .path = "/bin/sh",
+        .args = &.{ "/bin/sh", "-c", "exit 0" },
+        .cwd = "/tmp",
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+
     try cmd.testingStart();
     try testing.expect(cmd.pid != null);
+    if (builtin.os.tag == .macos) {
+        try testing.expect(cmd.launch_identity != null);
+        try testing.expectEqual(@as(u32, @intCast(cmd.pid.?)), cmd.launch_identity.?.pid);
+        try testing.expectEqual(cmd.launch_identity.?.pid, cmd.launch_identity.?.pgid);
+    }
     const exit = try cmd.wait(true);
     try testing.expect(exit == .Exited);
-    try testing.expect(exit.Exited == 1);
+    try testing.expectEqual(@as(u32, 0), @as(u32, exit.Exited));
 }
 
 // If cmd.start fails with error.ExecFailedInChild it's the _child_ process that is running. If it does not
