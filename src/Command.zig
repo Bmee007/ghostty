@@ -219,21 +219,21 @@ fn captureLaunchIdentityStartToken(_: *Command, pid: posix.pid_t) ?u64 {
     return if (start_token == 0) null else start_token;
 }
 
-/// Capture the immutable launch identity of the just-forked child. Called in the parent
-/// after the child reaches exec with successful post-fork/pre-exec setup and before start()
-/// returns. The parent captured the birth token immediately after fork; after exec-success EOF
-/// we re-capture it and require equality, then observe pgid only after child setup is complete.
-/// If any field is unavailable or contradictory, identity is left null so the C ABI fails closed.
+/// Publish the immutable launch identity of the just-forked child, after the child confirms
+/// successful post-fork/pre-exec setup and exec over the setup pipe. The birth token is read in
+/// the parent immediately after fork, where proc_pidinfo is permitted. macOS denies
+/// proc_pidinfo(PROC_PIDTBSDINFO) with EPERM once the child has setsid()+exec'd (observed: rc=0,
+/// errno=1, target still alive), so the identity is no longer re-read post-exec. exec-success EOF
+/// is itself the proof that child setup succeeded: a failed setsid/setup aborts the launch through
+/// the setup pipe. A successful setsid makes the child its own process-group leader, so pgid == pid
+/// by construction rather than by observation. If the token is unavailable, identity stays null so
+/// the C ABI fails closed.
 fn captureLaunchIdentity(self: *Command, pid: posix.pid_t, fork_start_token: u64) void {
-    const start_token = fork_start_token;
-    const info = processBsdInfo(pid) orelse return;
-    const confirmed_start_token = startTokenFromInfo(info);
-    if (confirmed_start_token == 0 or fork_start_token == 0 or start_token != confirmed_start_token) return;
-    if (info.pbi_pgid == 0 or info.pbi_pgid != @as(u32, @intCast(pid))) return;
+    if (fork_start_token == 0) return;
     self.launch_identity = .{
         .pid = @intCast(pid),
-        .pgid = @intCast(info.pbi_pgid),
-        .start_token = confirmed_start_token,
+        .pgid = @intCast(pid),
+        .start_token = fork_start_token,
     };
 }
 
